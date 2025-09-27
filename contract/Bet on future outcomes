@@ -1,1 +1,258 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
 
+/**
+ * @title PredictionMarket
+ * @dev A decentralized prediction market where users can bet on future outcomes
+ * @author Solidity Developer
+ */
+contract PredictionMarket {
+    
+    // Structs
+    struct Market {
+        uint256 id;
+        string question;
+        string[] options;
+        uint256 endTime;
+        uint256 resolutionTime;
+        bool isResolved;
+        uint256 winningOption;
+        address creator;
+        uint256 totalPool;
+        mapping(uint256 => uint256) optionPools;
+        mapping(address => mapping(uint256 => uint256)) userBets;
+    }
+    
+    struct UserBet {
+        uint256 marketId;
+        uint256 option;
+        uint256 amount;
+        bool claimed;
+    }
+    
+    // State Variables
+    mapping(uint256 => Market) public markets;
+    mapping(address => UserBet[]) public userBets;
+    uint256 public marketCounter;
+    uint256 public constant MIN_BET = 0.01 ether;
+    uint256 public constant HOUSE_FEE = 2; // 2% house fee
+    
+    address public owner;
+    
+    // Events
+    event MarketCreated(uint256 indexed marketId, string question, address creator);
+    event BetPlaced(uint256 indexed marketId, address indexed user, uint256 option, uint256 amount);
+    event MarketResolved(uint256 indexed marketId, uint256 winningOption);
+    event RewardsClaimed(address indexed user, uint256 amount);
+    
+    // Modifiers
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    modifier validMarket(uint256 _marketId) {
+        require(_marketId < marketCounter, "Market does not exist");
+        _;
+    }
+    
+    modifier marketOpen(uint256 _marketId) {
+        require(block.timestamp < markets[_marketId].endTime, "Market is closed for betting");
+        require(!markets[_marketId].isResolved, "Market is already resolved");
+        _;
+    }
+    
+    // Constructor
+    constructor() {
+        owner = msg.sender;
+    }
+    
+    /**
+     * @dev Creates a new prediction market
+     * @param _question The question for the market
+     * @param _options Array of possible outcomes
+     * @param _duration Duration in seconds for how long betting is open
+     */
+    function createMarket(
+        string memory _question,
+        string[] memory _options,
+        uint256 _duration
+    ) external returns (uint256) {
+        require(_options.length >= 2, "Must have at least 2 options");
+        require(_options.length <= 10, "Too many options");
+        require(_duration > 0, "Duration must be positive");
+        
+        uint256 marketId = marketCounter++;
+        Market storage newMarket = markets[marketId];
+        
+        newMarket.id = marketId;
+        newMarket.question = _question;
+        newMarket.options = _options;
+        newMarket.endTime = block.timestamp + _duration;
+        newMarket.resolutionTime = 0;
+        newMarket.isResolved = false;
+        newMarket.creator = msg.sender;
+        newMarket.totalPool = 0;
+        
+        emit MarketCreated(marketId, _question, msg.sender);
+        return marketId;
+    }
+    
+    /**
+     * @dev Places a bet on a specific option in a market
+     * @param _marketId The ID of the market
+     * @param _option The option to bet on (index)
+     */
+    function placeBet(uint256 _marketId, uint256 _option) 
+        external 
+        payable 
+        validMarket(_marketId) 
+        marketOpen(_marketId) 
+    {
+        require(msg.value >= MIN_BET, "Bet amount too low");
+        require(_option < markets[_marketId].options.length, "Invalid option");
+        
+        Market storage market = markets[_marketId];
+        
+        // Update market pools
+        market.totalPool += msg.value;
+        market.optionPools[_option] += msg.value;
+        market.userBets[msg.sender][_option] += msg.value;
+        
+        // Record user bet
+        userBets[msg.sender].push(UserBet({
+            marketId: _marketId,
+            option: _option,
+            amount: msg.value,
+            claimed: false
+        }));
+        
+        emit BetPlaced(_marketId, msg.sender, _option, msg.value);
+    }
+    
+    /**
+     * @dev Resolves a market with the winning option
+     * @param _marketId The ID of the market to resolve
+     * @param _winningOption The index of the winning option
+     */
+    function resolveMarket(uint256 _marketId, uint256 _winningOption) 
+        external 
+        onlyOwner 
+        validMarket(_marketId) 
+    {
+        Market storage market = markets[_marketId];
+        require(block.timestamp >= market.endTime, "Betting period not ended");
+        require(!market.isResolved, "Market already resolved");
+        require(_winningOption < market.options.length, "Invalid winning option");
+        
+        market.isResolved = true;
+        market.winningOption = _winningOption;
+        market.resolutionTime = block.timestamp;
+        
+        emit MarketResolved(_marketId, _winningOption);
+    }
+    
+    /**
+     * @dev Allows users to claim their rewards from winning bets
+     * @param _marketId The ID of the resolved market
+     */
+    function claimRewards(uint256 _marketId) external validMarket(_marketId) {
+        Market storage market = markets[_marketId];
+        require(market.isResolved, "Market not resolved yet");
+        
+        uint256 userWinningBet = market.userBets[msg.sender][market.winningOption];
+        require(userWinningBet > 0, "No winning bet found");
+        
+        // Calculate rewards
+        uint256 winningPool = market.optionPools[market.winningOption];
+        uint256 totalPool = market.totalPool;
+        
+        // Calculate house fee
+        uint256 houseFee = (totalPool * HOUSE_FEE) / 100;
+        uint256 distributionPool = totalPool - houseFee;
+        
+        // Calculate user's share of rewards
+        uint256 userReward = (userWinningBet * distributionPool) / winningPool;
+        
+        // Mark as claimed and transfer
+        market.userBets[msg.sender][market.winningOption] = 0;
+        
+        // Update user bet records
+        for (uint i = 0; i < userBets[msg.sender].length; i++) {
+            if (userBets[msg.sender][i].marketId == _marketId && 
+                userBets[msg.sender][i].option == market.winningOption &&
+                !userBets[msg.sender][i].claimed) {
+                userBets[msg.sender][i].claimed = true;
+            }
+        }
+        
+        payable(msg.sender).transfer(userReward);
+        emit RewardsClaimed(msg.sender, userReward);
+    }
+    
+    // View Functions
+    function getMarketDetails(uint256 _marketId) 
+        external 
+        view 
+        validMarket(_marketId) 
+        returns (
+            string memory question,
+            string[] memory options,
+            uint256 endTime,
+            bool isResolved,
+            uint256 winningOption,
+            uint256 totalPool
+        ) 
+    {
+        Market storage market = markets[_marketId];
+        return (
+            market.question,
+            market.options,
+            market.endTime,
+            market.isResolved,
+            market.winningOption,
+            market.totalPool
+        );
+    }
+    
+    function getOptionPool(uint256 _marketId, uint256 _option) 
+        external 
+        view 
+        validMarket(_marketId) 
+        returns (uint256) 
+    {
+        return markets[_marketId].optionPools[_option];
+    }
+    
+    function getUserBet(uint256 _marketId, uint256 _option, address _user) 
+        external 
+        view 
+        validMarket(_marketId) 
+        returns (uint256) 
+    {
+        return markets[_marketId].userBets[_user][_option];
+    }
+    
+    function getUserBetHistory(address _user) 
+        external 
+        view 
+        returns (UserBet[] memory) 
+    {
+        return userBets[_user];
+    }
+    
+    function getMarketCount() external view returns (uint256) {
+        return marketCounter;
+    }
+    
+    // Owner functions
+    function withdrawHouseFees() external onlyOwner {
+        uint256 balance = address(this).balance;
+        // Calculate unclaimed fees (simplified approach)
+        payable(owner).transfer(balance);
+    }
+    
+    function emergencyPause(uint256 _marketId) external onlyOwner validMarket(_marketId) {
+        markets[_marketId].endTime = block.timestamp;
+    }
+}
